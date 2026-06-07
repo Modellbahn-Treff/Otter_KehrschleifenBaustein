@@ -1,8 +1,8 @@
 ** Drc report for Kehrschleifenbaustein.kicad_pcb **
-** Created on 2026-06-07T15:51:24 **
+** Created on 2026-06-07T16:16:30 **
 ** Report includes: Errors, Warnings, Exclusions **
 
-** Found 14 DRC violations **
+** Found 13 DRC violations **
 [starved_thermal]: Thermal relief connection to zone incomplete (layer F.Cu; 1 spokes connected to isolated island)
     Local override; error
     @(96.8428 mm, 114.7473 mm): Zone [GND] on F.Cu and B.Cu, priority 1
@@ -16,13 +16,13 @@
     @(129.3548 mm, 110.7380 mm): Footprint U3
 [lib_footprint_issues]: The current configuration does not include the footprint library 'custom'
     Local override; warning
-    @(103.7008 mm, 60.8860 mm): Footprint J1
-[lib_footprint_issues]: The current configuration does not include the footprint library 'custom'
-    Local override; warning
     @(181.4888 mm, 60.3100 mm): Footprint Display1
 [lib_footprint_issues]: The current configuration does not include the footprint library 'custom'
     Local override; warning
     @(178.1008 mm, 90.3280 mm): Footprint U2
+[lib_footprint_issues]: The current configuration does not include the footprint library 'custom'
+    Local override; warning
+    @(103.7008 mm, 60.8860 mm): Footprint J1
 [lib_footprint_issues]: The current configuration does not include the footprint library 'custom'
     Local override; warning
     @(194.6108 mm, 90.3280 mm): Footprint U1
@@ -31,16 +31,16 @@
     @(192.0928 mm, 84.0100 mm): Reference field of SW2
 [silk_overlap]: Silkscreen clearance
     Rule: board setup constraints silk; warning
-    @(194.6108 mm, 90.3280 mm): Segment of U1 on F.Silkscreen
-    @(165.4008 mm, 90.3280 mm): Segment of U2 on F.Silkscreen
-[silk_overlap]: Silkscreen clearance
-    Rule: board setup constraints silk; warning
     @(194.6108 mm, 139.8580 mm): Segment of U1 on F.Silkscreen
     @(165.4008 mm, 139.8580 mm): Segment of U2 on F.Silkscreen
+[silk_overlap]: Silkscreen clearance
+    Rule: board setup constraints silk; warning
+    @(194.6108 mm, 90.3280 mm): Segment of U1 on F.Silkscreen
+    @(165.4008 mm, 90.3280 mm): Segment of U2 on F.Silkscreen
 [silk_over_copper]: Silkscreen clipped by solder mask
     Local override; warning
-    @(103.7008 mm, 60.8860 mm): Reference field of J1
-    @(103.7008 mm, 60.8860 mm): PTH pad 1 [-15V] of J1
+    @(194.6108 mm, 139.8580 mm): Segment of U1 on F.Silkscreen
+    @(185.7428 mm, 140.1340 mm): NPTH pad of H4
 [silk_over_copper]: Silkscreen clipped by solder mask
     Local override; warning
     @(168.5108 mm, 51.3050 mm): Segment of Display1 on F.Silkscreen
@@ -49,10 +49,6 @@
     Local override; warning
     @(191.6108 mm, 51.3050 mm): Segment of Display1 on F.Silkscreen
     @(191.7700 mm, 50.2920 mm): NPTH pad of H3
-[silk_over_copper]: Silkscreen clipped by solder mask
-    Local override; warning
-    @(194.6108 mm, 139.8580 mm): Segment of U1 on F.Silkscreen
-    @(185.7428 mm, 140.1340 mm): NPTH pad of H4
 
 ** Found 0 unconnected pads **
 
