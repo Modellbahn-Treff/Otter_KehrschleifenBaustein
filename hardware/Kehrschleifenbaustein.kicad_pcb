@@ -12447,7 +12447,7 @@
 		)
 	)
 	(gr_text "Rail red\nRail green\nGND (5V)\n+5V\n"
-		(at 100.39881 106.606 0)
+		(at 99.568 106.606 0)
 		(layer "F.SilkS")
 		(uuid "e053f0d4-e302-4b2a-80f0-ae87e5a19721")
 		(effects
