@@ -1,0 +1,507 @@
+<!--
+  Copyright (C) 2026 Modellbahn-Treff for Kids GmbH
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Otter KehrschleifenBaustein — Flasher</title>
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 2.5rem;
+    }
+
+    header h1 {
+      font-size: 1.75rem;
+      font-weight: 600;
+      color: #f0f6fc;
+    }
+
+    header p {
+      margin-top: 0.4rem;
+      color: #8b949e;
+      font-size: 0.95rem;
+    }
+
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 1.75rem;
+      width: 100%;
+      max-width: 520px;
+      margin-bottom: 1.25rem;
+    }
+
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: #f0f6fc;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .step-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.5rem;
+      height: 1.5rem;
+      border-radius: 50%;
+      background: #1f6feb;
+      font-size: 0.75rem;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    .flash-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    esp-web-install-button::part(button) {
+      background: #238636;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 0.6rem 1.4rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    esp-web-install-button::part(button):hover {
+      background: #2ea043;
+    }
+
+    .hint {
+      color: #8b949e;
+      font-size: 0.82rem;
+      text-align: center;
+    }
+
+    label {
+      display: block;
+      font-size: 0.85rem;
+      color: #8b949e;
+      margin-bottom: 0.3rem;
+      margin-top: 0.85rem;
+    }
+
+    label:first-of-type { margin-top: 0; }
+
+    input[type="text"],
+    input[type="password"],
+    input[type="number"] {
+      width: 100%;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #e6edf3;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    input:focus { border-color: #1f6feb; }
+
+    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+
+    .ip-preview {
+      margin-top: 0.85rem;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 0.5rem 0.75rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+
+    .ip-preview-row {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-family: "SF Mono", "Fira Mono", monospace;
+      font-size: 0.85rem;
+    }
+
+    .ip-label {
+      color: #8b949e;
+      min-width: 4.5rem;
+    }
+
+    .ip-preview-row span:last-child { color: #58a6ff; }
+
+    .btn-row {
+      display: flex;
+      gap: 0.75rem;
+      margin-top: 1.1rem;
+    }
+
+    button {
+      border: none;
+      border-radius: 6px;
+      padding: 0.55rem 1.1rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .btn-primary {
+      background: #1f6feb;
+      color: #fff;
+      flex: 1;
+    }
+
+    .btn-primary:hover { background: #388bfd; }
+    .btn-primary:disabled { background: #21262d; color: #484f58; cursor: default; }
+
+    .btn-secondary {
+      background: #21262d;
+      color: #e6edf3;
+      border: 1px solid #30363d;
+    }
+
+    .btn-secondary:hover { background: #30363d; }
+
+    #log-wrap {
+      width: 100%;
+      max-width: 960px;
+      padding: 0 1rem;
+    }
+
+    .log-controls {
+      display: flex;
+      gap: 0.75rem;
+      margin-bottom: 0.5rem;
+    }
+
+    footer {
+      margin-top: 2rem;
+      color: #484f58;
+      font-size: 0.78rem;
+      text-align: center;
+    }
+
+    footer a {
+      color: #8b949e;
+    }
+
+    #log {
+      font-family: "SF Mono", "Fira Mono", monospace;
+      font-size: 0.8rem;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 0.75rem;
+      height: 20rem;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #8b949e;
+    }
+
+    .log-ok  { color: #3fb950; }
+    .log-err { color: #f85149; }
+    .log-inf { color: #58a6ff; }
+
+    .unsupported-warning {
+      background: #3d2c00;
+      border: 1px solid #9e6a03;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      color: #e3b341;
+      font-size: 0.9rem;
+      text-align: center;
+      max-width: 520px;
+      margin-bottom: 1.25rem;
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Otter KehrschleifenBaustein</h1>
+    <p>Flash firmware and configure WiFi directly from your browser</p>
+  </header>
+
+  <div id="unsupported" class="unsupported-warning hidden">
+    Your browser does not support the <strong>Web Serial API</strong>.<br>
+    Please use <strong>Chrome or Edge 89+</strong> on desktop.
+  </div>
+
+  <!-- Step 1: Flash -->
+  <div class="card" id="card-flash">
+    <h2><span class="step-badge">1</span> Flash Firmware</h2>
+    <div class="flash-wrap">
+      <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+      <p class="hint">Connect the ESP32 via USB, then click Install.<br>Hold BOOT if the device doesn't enter flash mode automatically.</p>
+    </div>
+  </div>
+
+  <!-- Step 2: Configure WiFi -->
+  <div class="card" id="card-wifi">
+    <h2><span class="step-badge">2</span> Configure WiFi</h2>
+
+    <label for="ssid">WiFi SSID</label>
+    <input type="text" id="ssid" placeholder="MyNetwork" autocomplete="off" spellcheck="false">
+
+    <label for="password">WiFi Password</label>
+    <input type="password" id="password" placeholder="••••••••" autocomplete="off">
+
+    <div class="row2" style="margin-top: 0.85rem;">
+      <div>
+        <label for="abs">Section Number</label>
+        <input type="number" id="abs" min="0" max="255" placeholder="1">
+      </div>
+      <div>
+        <label for="kb">Building Block Number</label>
+        <input type="number" id="kb" min="0" max="255" placeholder="1">
+      </div>
+    </div>
+    <div class="row2">
+      <div>
+        <label for="net1">Network Byte 1</label>
+        <input type="number" id="net1" min="0" max="255" placeholder="10">
+      </div>
+      <div>
+        <label for="net2">Network Byte 2</label>
+        <input type="number" id="net2" min="0" max="255" placeholder="1">
+      </div>
+    </div>
+    <div class="row2">
+      <div>
+        <label for="gw3">Gateway Byte 3</label>
+        <input type="number" id="gw3" min="0" max="255" placeholder="0">
+      </div>
+      <div>
+        <label for="gw4">Gateway Byte 4</label>
+        <input type="number" id="gw4" min="0" max="255" placeholder="1">
+      </div>
+    </div>
+    <div class="ip-preview">
+      <div class="ip-preview-row"><span class="ip-label">ESP-IP</span><span id="esp-ip">–</span></div>
+      <div class="ip-preview-row"><span class="ip-label">GW-IP</span><span id="gw-ip">–</span></div>
+    </div>
+    <label for="mqtt">MQTT Server (IP)</label>
+    <input type="text" id="mqtt" placeholder="10.1.0.5" autocomplete="off" spellcheck="false">
+
+    <div class="btn-row">
+      <button class="btn-primary" id="btn-connect">Connect &amp; Configure</button>
+    </div>
+  </div>
+
+  <div id="log-wrap">
+    <div class="log-controls">
+      <button class="btn-secondary" id="btn-monitor">Connect Console</button>
+      <button class="btn-secondary hidden" id="btn-disconnect">Disconnect</button>
+    </div>
+    <div id="log"></div>
+  </div>
+
+  <footer>
+    <a href="NOTICE">Open Source Licenses</a>
+  </footer>
+
+  <script>
+    // --- browser support check ---
+    if (!("serial" in navigator)) {
+      document.getElementById("unsupported").classList.remove("hidden");
+    }
+
+    // --- live IP preview ---
+    const ipInputs = ["abs", "kb", "net1", "net2", "gw3", "gw4"].map(id => document.getElementById(id));
+    const espIpEl = document.getElementById("esp-ip");
+    const gwIpEl  = document.getElementById("gw-ip");
+
+    function byte(id) {
+      const v = document.getElementById(id).value;
+      return v === "" ? "?" : v;
+    }
+
+    function updateIpPreview() {
+      espIpEl.textContent = `${byte("net1")}.${byte("net2")}.${byte("abs")}.${byte("kb")}`;
+      gwIpEl.textContent  = `${byte("net1")}.${byte("net2")}.${byte("gw3")}.${byte("gw4")}`;
+    }
+
+    // --- persist network/gateway bytes ---
+    const persistIds = ["net1", "net2", "gw3", "gw4", "mqtt"];
+
+    persistIds.forEach(id => {
+      const el = document.getElementById(id);
+      const saved = localStorage.getItem("oks_" + id);
+      if (saved !== null) el.value = saved;
+      el.addEventListener("input", () => localStorage.setItem("oks_" + id, el.value));
+    });
+
+    ipInputs.forEach(el => el.addEventListener("input", updateIpPreview));
+    updateIpPreview();
+
+    // --- serial state ---
+    let port = null;
+    let writer = null;
+    let reader = null;
+    let readLoop = null;
+    let lineBuffer = "";
+
+    const logEl = document.getElementById("log");
+    const btnConnect = document.getElementById("btn-connect");
+    const btnMonitor = document.getElementById("btn-monitor");
+    const btnDisconnect = document.getElementById("btn-disconnect");
+
+    function log(text, cls = "") {
+      const line = document.createElement("div");
+      if (cls) line.className = cls;
+      line.textContent = text;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function connect() {
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+
+        const textDecoder = new TextDecoderStream();
+        port.readable.pipeTo(textDecoder.writable);
+        reader = textDecoder.readable.getReader();
+
+        const textEncoder = new TextEncoderStream();
+        textEncoder.readable.pipeTo(port.writable);
+        writer = textEncoder.writable.getWriter();
+
+        log("Connected.", "log-inf");
+        btnConnect.textContent = "Send Configuration";
+        btnConnect.onclick = sendConfig;
+        btnMonitor.classList.add("hidden");
+        btnDisconnect.classList.remove("hidden");
+
+        // start read loop to show device output
+        readLoop = (async () => {
+          try {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (value) {
+                lineBuffer += value;
+                const lines = lineBuffer.split(/\r?\n/);
+                lineBuffer = lines.pop(); // keep incomplete trailing chunk
+                lines.forEach(line => {
+                  if (!line.trim()) return;
+                  const cls = line.startsWith("OK") ? "log-ok"
+                            : line.startsWith("ERROR") ? "log-err"
+                            : "";
+                  log(line, cls);
+                });
+              }
+            }
+          } catch (_) { /* port closed */ }
+        })();
+
+      } catch (err) {
+        log("Connection failed: " + err.message, "log-err");
+      }
+    }
+
+    async function sendConfig() {
+      const ssid = document.getElementById("ssid").value.trim();
+      const pw   = document.getElementById("password").value;
+
+      if (!ssid) {
+        log("ERROR: SSID is required.", "log-err");
+        return;
+      }
+
+      btnConnect.disabled = true;
+
+      try {
+        // WiFi credentials
+        const wifiCmd = `wifi ${JSON.stringify({ ssid, password: pw })}\r\n`;
+        log("> " + wifiCmd.trim(), "log-inf");
+        await writer.write(wifiCmd);
+
+        // Advanced / set command (only if any field is filled)
+        const setPayload = {};
+        const absVal  = document.getElementById("abs").value;
+        const kbVal   = document.getElementById("kb").value;
+        const mqttVal = document.getElementById("mqtt").value.trim();
+        const net1Val = document.getElementById("net1").value;
+        const net2Val = document.getElementById("net2").value;
+        const gw3Val  = document.getElementById("gw3").value;
+        const gw4Val  = document.getElementById("gw4").value;
+
+        if (absVal  !== "") setPayload.AbschNummer           = parseInt(absVal, 10);
+        if (kbVal   !== "") setPayload.KehrschleifenBaustein = parseInt(kbVal, 10);
+        if (mqttVal !== "") setPayload.mqtt_server            = mqttVal;
+        if (net1Val !== "") setPayload.networkByte1           = parseInt(net1Val, 10);
+        if (net2Val !== "") setPayload.networkByte2           = parseInt(net2Val, 10);
+        if (gw3Val  !== "") setPayload.gatewayByte3           = parseInt(gw3Val, 10);
+        if (gw4Val  !== "") setPayload.gatewayByte4           = parseInt(gw4Val, 10);
+
+        if (Object.keys(setPayload).length > 0) {
+          // Small delay so the device processes the wifi command first
+          await new Promise(r => setTimeout(r, 300));
+          const setCmd = `set ${JSON.stringify(setPayload)}\r\n`;
+          log("> " + setCmd.trim(), "log-inf");
+          await writer.write(setCmd);
+        }
+
+        log("Commands sent. Waiting for device response...", "log-inf");
+        // The device will restart after WiFi credentials are saved;
+        // disconnect after a short wait.
+        setTimeout(disconnect, 4000);
+
+      } catch (err) {
+        log("Send failed: " + err.message, "log-err");
+        btnConnect.disabled = false;
+      }
+    }
+
+    async function disconnect() {
+      try {
+        if (reader) { await reader.cancel(); reader = null; }
+        if (writer) { await writer.close(); writer = null; }
+        if (port)   { await port.close();   port = null; }
+      } catch (_) { /* ignore */ }
+      lineBuffer = "";
+      log("Disconnected.", "log-inf");
+      btnConnect.textContent = "Connect & Configure";
+      btnConnect.onclick = connect;
+      btnConnect.disabled = false;
+      btnDisconnect.classList.add("hidden");
+      btnMonitor.classList.remove("hidden");
+    }
+
+    btnConnect.onclick = connect;
+    btnMonitor.onclick = connect;
+    btnDisconnect.onclick = disconnect;
+  </script>
+</body>
+</html>

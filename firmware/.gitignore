@@ -1,0 +1,14 @@
+# ESP-IDF build output
+build/
+
+# Downloaded IDF components (equivalent to node_modules)
+managed_components/
+
+# Backup config
+sdkconfig.old
+
+# macOS
+.DS_Store
+
+# VS Code machine-specific settings (contains local IDF path and USB port)
+.vscode/

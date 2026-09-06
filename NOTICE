@@ -1,0 +1,25 @@
+Otter KehrschleifenBaustein
+Copyright (C) 2026 Modellbahn-Treff for Kids GmbH
+
+This product includes software developed by third parties:
+
+ESP-IDF
+  Copyright (c) Espressif Systems (Shanghai) Co., Ltd.
+  Licensed under the Apache License 2.0
+  https://github.com/espressif/esp-idf
+
+esp-mqtt
+  Copyright 2016 Tuan PM
+  Copyright Espressif Systems (Shanghai) CO LTD
+  Licensed under the Apache License 2.0
+  https://github.com/espressif/esp-mqtt
+
+cJSON
+  Copyright (c) 2009-2017 Dave Gamble and cJSON contributors
+  Licensed under the MIT License
+  https://github.com/DaveGamble/cJSON
+
+esp-web-tools
+  Copyright (c) ESPHome contributors
+  Licensed under the Apache License 2.0
+  https://github.com/esphome/esp-web-tools

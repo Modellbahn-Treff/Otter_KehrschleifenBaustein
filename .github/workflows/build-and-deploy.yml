@@ -1,0 +1,148 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build firmware
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.1
+          target: esp32
+          path: firmware/
+          command: idf.py build
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Assemble deploy directory
+        run: |
+          mkdir -p deploy
+          cp -r web/* deploy/
+          cp firmware/build/otter_kb.bin deploy/
+          cp firmware/build/bootloader/bootloader.bin deploy/
+          cp firmware/build/partition_table/partition-table.bin deploy/
+          cp NOTICE deploy/
+
+      - name: Inject version into manifest
+        run: |
+          jq --arg v "${{ steps.version.outputs.version }}" '.version = $v' web/manifest.json > deploy/manifest.json
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy
+          path: deploy/
+
+  deploy-dev:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'branch'
+    concurrency:
+      group: deploy-gh-pages
+      cancel-in-progress: false
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy
+          path: deploy/
+
+      - name: Deploy to flash/dev
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: deploy/
+          destination_dir: flash/dev
+          keep_files: true
+
+  deploy-tag:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' && github.event_name != 'release'
+    concurrency:
+      group: deploy-gh-pages
+      cancel-in-progress: false
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy
+          path: deploy/
+
+      - name: Deploy to flash/${{ github.ref_name }}
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: deploy/
+          destination_dir: flash/${{ github.ref_name }}
+          keep_files: true
+
+  deploy-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && github.event.release.prerelease == false
+    concurrency:
+      group: deploy-gh-pages
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy
+          path: deploy/
+
+      - name: Deploy to flash/<tag> and flash/ in one push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
+            git fetch origin gh-pages
+            git checkout gh-pages
+          else
+            git checkout --orphan gh-pages
+            git rm -rf . > /dev/null 2>&1 || true
+          fi
+
+          mkdir -p "flash/${TAG}"
+          rsync -a --delete "${GITHUB_WORKSPACE}/deploy/" "flash/${TAG}/"
+          rsync -a "${GITHUB_WORKSPACE}/deploy/" flash/
+
+          git add .
+          git diff --staged --quiet || git commit -m "Deploy release ${TAG}"
+          git push origin gh-pages
