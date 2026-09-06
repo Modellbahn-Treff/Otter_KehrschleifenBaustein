@@ -1,6 +1,6 @@
 {
   "name": "Otter KehrschleifenBaustein",
-  "version": "1aa008b",
+  "version": "3e16d29",
   "builds": [
     {
       "chipFamily": "ESP32",
