@@ -2,7 +2,7 @@
 
 ESP32 firmware for the Otter model railroad control system. Each board runs exactly one KehrschleifenBaustein (reversing-loop module), which switches track polarity via its bistable relays (K1/K2) and reports/controls state over WiFi and MQTT.
 
-**Status: work in progress.** The occupancy sensing, loop-voltage measurement and the [state machine](#state-machine) in [main/kb.cpp](main/kb.cpp) are implemented; the relay switching, display and MQTT publishing of the state are not yet — see the `TODO`s there. Everything else (WiFi/MQTT bring-up, NVS-backed settings, serial console) mirrors the [Otter_VerteilerBaustein](../../Otter_VerteilerBaustein) firmware structure.
+**Status: work in progress.** The occupancy sensing, loop-voltage measurement, the [state machine](#state-machine) in [main/kb.cpp](main/kb.cpp) and the [OLED display](#display) are implemented; the relay switching and the MQTT publishing of the state are not yet — see the `TODO`s there. Everything else (WiFi/MQTT bring-up, NVS-backed settings, serial console) mirrors the [Otter_VerteilerBaustein](../../Otter_VerteilerBaustein) firmware structure.
 
 ## Requirements
 
@@ -198,12 +198,46 @@ If all detectors clear while at the previous evaluation only inner detectors wer
 - A normal exit through `ExtA`/`ExtB` is not delayed.
 - Entering a fail-safe state (e.g. loss of loop voltage) cancels the timeout immediately.
 
+## Display
+
+`Display1`, a 128x64 SSD1306 OLED on I2C address `0x3C` (`SDA` = GPIO21, `SCL` = GPIO22),
+driven by [main/display.cpp](main/display.cpp). The panel is optional: if it does not
+answer at boot the board logs a warning and runs the loop without it.
+
+The button `SW2` (GPIO27, shorts to GND) pages through three screens. The top two rows
+are the same everywhere — the board name with the connection state (`MQTT` / `WiFi` /
+`----`), and the name and number of the current screen.
+
+```
++---------------------+  +---------------------+  +---------------------+
+|Kehrschleife   MQTT  |  |Kehrschleife   MQTT  |  |Kehrschleife   MQTT  |
+|Loop             1/3 |  |Network          2/3 |  |Sensors          3/3 |
+|State 3   Pol B      |  |WiFi: OK             |  |ADC raw    thr 35    |
+|Leaving through B    |  |IP:   192.168.5.20   |  |IntA: 1230           |
+|Loop ON   U 16.2V    |  |MQTT: 192.168.5.10   |  |IntM:   12           |
+|                     |  |ID:   KB1            |  |IntB: 4095           |
+|Ea Ia Im Ib Eb       |  |                     |  |Ubus: 2145  16.2V    |
+|.  .  #  #  .        |  |                     |  |                     |
++---------------------+  +---------------------+  +---------------------+
+```
+
+| Screen | Shows |
+|--------|-------|
+| **Loop** | The [state](#states) as a number and in words, the resulting track polarity (`A`, `B`, or `-` while the loop is off), whether the loop is powered, the measured loop voltage, and the five detectors in track order (`#` = occupied). `LOST` appears next to the state while the [lost-train timeout](#lost-train-timeout) is running. |
+| **Network** | WiFi status, the board's IP address, the MQTT broker it is connected to, and its client ID. |
+| **Sensors** | The averaged raw ADC readings the state machine actually compares against — the three occupancy inputs against their threshold, and the loop voltage both raw and converted. Use this screen to check the detector threshold and the voltage divider. |
+
+The state machine redraws on every change; the live values are refreshed every 250 ms.
+Only the display rows that really changed are sent over I2C, so an idle board produces
+no bus traffic.
+
 ## Project structure
 
 ```
 main/
 ├── main.cpp              – Entry point; WiFi & MQTT initialisation
-├── kb.cpp / kb.h         – Kehrschleifen (reversing-loop) module logic: sensing, voltage, state machine [relay/display TODO]
+├── kb.cpp / kb.h         – Kehrschleifen (reversing-loop) module logic: sensing, voltage, state machine [relay TODO]
+├── display.cpp / .h      – SSD1306 OLED driver and the screens described below
 ├── settings.cpp / .h     – NVS-backed configuration store
 ├── serial_config.cpp / .h – Serial configuration console
 └── otter.cpp / otter.h   – Shared pin mapping & MQTT topic definitions [placeholder — TODO]

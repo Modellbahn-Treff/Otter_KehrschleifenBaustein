@@ -3,6 +3,7 @@
 
 #include "kb.h"
 #include "otter.h"
+#include "display.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_adc/adc_oneshot.h"
@@ -20,14 +21,16 @@ static void updateDisplay(void);
 #define VOLTAGE_DIVIDER_TOP_K    75  // R41
 #define VOLTAGE_DIVIDER_BOT_K    10  // R42
 #define VOLTAGE_THRESHOLD_MV  10000  // 10 V
+#define SENSE_THRESHOLD_RAW      35  // averaged raw ADC value above which a Melder counts as occupied
+#define SENSE_HOLD_MS           500  // debounce: keep "occupied" this long after the last detection
 #define LOST_TRAIN_TIMEOUT_MS 60000  // keep the loop powered this long after a train vanished inside
+#define DISPLAY_REFRESH_MS      250  // redraw interval for the live values (voltage, raw ADC)
+#define BUTTON_DEBOUNCE_MS       50  // ignore further edges on the screen button for this long
 
 static uint8_t  kbStatus = 0;                                     // 0=off, 1=Train is about to enter from A, 2=Train entered from A, 3=Train leaving through B, 4=Train is about to enter from B, 5= Train entered from B, 6=Train leaving through A, 7=Fail-safe because of trains on both sides, 8=Fail-safe because of low voltage, 9=Fail-safe because of voltage during off state, 10=Fail-safe because of too long train in the loop
 
-static bool     turningOff = false;                               // true if the loop is about to be turned off (train has left)
-static uint32_t turnOffTimer = 0;                                 // millis() when the loop should be turned off (if the train doesnt come back again)
-
-static float    voltage = 0.0f;                                   // voltage in the loop
+static float    voltage = 0.0f;                                   // voltage in the loop, in mV
+static uint16_t voltageRaw = 0;                                   // averaged raw ADC reading behind `voltage`
 static bool     voltagePresent = false;                           // true if voltage is present in the loop (above VOLTAGE_THRESHOLD_MV)
 
 static bool     ExtA = false;                                     // true if ExtA is occupied
@@ -320,10 +323,61 @@ static void calculateKBStatus(void) {
 
     if (kbStatus != previousStatus) {
         ESP_LOGI(TAG, "kbStatus: %u -> %u", previousStatus, kbStatus);
+
+        if (kbStatus == 0 || kbStatus >= 7) {
+            relayEnqueue((gpio_num_t)switchRelayPin[1]);  //turn off the loop
+        } else if (kbStatus == 1 || kbStatus == 2 || kbStatus == 6) {
+            relayEnqueue((gpio_num_t)switchRelayPin[0]); //turn on the loop
+            relayEnqueue((gpio_num_t)swapRelayPin[1]);
+        } else if (kbStatus == 3 || kbStatus == 4 || kbStatus == 5) {
+            relayEnqueue((gpio_num_t)switchRelayPin[0]);  //turn on the loop
+            relayEnqueue((gpio_num_t)swapRelayPin[0]);
+        }
     }
 }
 
+void KB_GetState(kb_state_t *out) {
+    if (!out) return;
+    out->status         = kbStatus;
+    out->ExtA           = ExtA;
+    out->IntA           = IntA;
+    out->IntM           = IntM;
+    out->IntB           = IntB;
+    out->ExtB           = ExtB;
+    out->trainLost      = trainLost;
+    out->voltagePresent = voltagePresent;
+    out->voltage_mv     = (uint32_t)voltage;
+    out->voltageRaw     = voltageRaw;
+    for (uint8_t p = 0; p < SENSE_PIN_COUNT; p++) {
+        out->senseRaw[p] = (uint16_t)(sensePinSums[p] / ADC_RING_SIZE);
+    }
+    out->senseThreshold = SENSE_THRESHOLD_RAW;
+}
+
 static void updateDisplay(void) {
+    kb_state_t state;
+    KB_GetState(&state);
+    display_update(&state);
+}
+
+// Screen button (SW2 on buttonPin, shorts to GND when pressed): pages
+// through the display screens. Polled from the 10 ms tick rather than run
+// off an interrupt, so it needs no ISR service of its own.
+static void updateButton(void) {
+    static bool     lastLevel  = true;   // released, thanks to the internal pull-up
+    static uint32_t lastChange = 0;
+
+    bool     level = gpio_get_level((gpio_num_t)buttonPin) != 0;
+    uint32_t now   = millis();
+
+    if (level != lastLevel && (uint32_t)(now - lastChange) >= BUTTON_DEBOUNCE_MS) {
+        lastChange = now;
+        lastLevel  = level;
+        if (!level) {                    // falling edge -> pressed
+            display_next_screen();
+            updateDisplay();
+        }
+    }
 }
 
 // Measures the loop voltage via voltagePin (75k/10k divider, R41/R42) and
@@ -339,10 +393,14 @@ static void updateVoltage(void) {
     uint32_t pin_mv   = (avg_raw * ADC_VREF_MV) / ADC_MAX_RAW;
     uint32_t loop_mv  = pin_mv * (VOLTAGE_DIVIDER_TOP_K + VOLTAGE_DIVIDER_BOT_K) / VOLTAGE_DIVIDER_BOT_K;
 
+    // Kept up to date on every sample, not only on threshold crossings, so
+    // the display shows the actual reading.
+    voltage    = loop_mv;
+    voltageRaw = (uint16_t)avg_raw;
+
     bool newVoltage = (loop_mv > VOLTAGE_THRESHOLD_MV);
     if (newVoltage != voltagePresent) {
         voltagePresent = newVoltage;
-        voltage = loop_mv;
         ESP_LOGI(TAG, "voltage: %s (%lu mV)", voltagePresent ? "present" : "absent", (unsigned long)voltage);
         calculateKBStatus();
         updateDisplay();
@@ -353,6 +411,16 @@ static void updateVoltage(void) {
 // 10 ms tick after the Melder inputs below have been sampled.
 void KB_Loop(void) {
     updateVoltage();
+    updateButton();
+
+    // The state machine redraws on every change, but the voltage and the raw
+    // ADC values move without one, so refresh them on a slow tick as well.
+    // Unchanged display pages cost no I2C traffic.
+    static uint32_t lastDisplayRefresh = 0;
+    if ((uint32_t)(millis() - lastDisplayRefresh) >= DISPLAY_REFRESH_MS) {
+        lastDisplayRefresh = millis();
+        updateDisplay();
+    }
 
     // Lost-train timeout expired: evaluate the state machine once more so it
     // can switch the loop off (-> 0) if the train has not reappeared.
@@ -384,7 +452,7 @@ void KB_Loop(void) {
             }
         }
 
-        // TODO: not finished yet — client/display/MqttMBM still need wiring up.
+        // TODO: not finished yet — MqttMBM still needs wiring up.
         if (sensePinStatus[p] != sensePinLastStatus[p]) {
             if (p == 0) {
                 IntA = (sensePinStatus[p] == 1);
