@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "kb.h"
+#include "display.h"
 #include "otter.h"
 #include "settings.h"
 #include "serial_config.h"
@@ -19,6 +20,11 @@
 static const char *TAG = "main";
 
 esp_mqtt_client_handle_t mqtt_client = nullptr;
+
+// Mirrored onto the display's network screen; only the handlers below know it.
+static bool s_wifi_ok = false;
+static bool s_mqtt_ok = false;
+static char s_ip_str[16] = "---";
 
 // ---------------------------------------------------------------------------
 // MQTT
@@ -32,6 +38,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT connected");
+            s_mqtt_ok = true;
+            display_set_network(s_wifi_ok, s_mqtt_ok, s_ip_str);
             esp_mqtt_client_subscribe(mqtt_client, MqttRefresh, 0);
             esp_mqtt_client_subscribe(mqtt_client, MqttSet, 0);
             esp_mqtt_client_subscribe(mqtt_client, MqttExtA, 0);
@@ -40,6 +48,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "MQTT disconnected");
+            s_mqtt_ok = false;
+            display_set_network(s_wifi_ok, s_mqtt_ok, s_ip_str);
             break;
 
         case MQTT_EVENT_DATA: {
@@ -125,10 +135,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "WiFi disconnected, reconnecting...");
+        s_wifi_ok = false;
+        s_mqtt_ok = false;
+        snprintf(s_ip_str, sizeof(s_ip_str), "---");
+        display_set_network(s_wifi_ok, s_mqtt_ok, s_ip_str);
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&ev->ip_info.ip));
+        snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&ev->ip_info.ip));
+        ESP_LOGI(TAG, "WiFi connected, IP: %s", s_ip_str);
+        s_wifi_ok = true;
+        display_set_network(s_wifi_ok, s_mqtt_ok, s_ip_str);
         esp_mqtt_client_start(mqtt_client);
     }
 }
@@ -178,6 +195,9 @@ extern "C" void app_main() {
 
     // Load settings from NVS (falls back to compiled-in defaults if not set)
     settings_load_from_nvs();
+
+    // Initialise the OLED before the module, so its first state is drawn
+    display_init();
 
     // Initialise GPIO for the Kehrschleifen module
     KB_Start();

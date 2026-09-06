@@ -6,6 +6,9 @@
 #include "display.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 
 static const char *TAG = "KB";
@@ -57,6 +60,30 @@ static uint16_t voltagePinSamples[ADC_RING_SIZE];  // ring buffer of raw ADC sam
 static uint8_t  voltagePinIndex = 0;                // ring index
 static uint32_t voltagePinSum   = 0;                // running sum
 
+// Non-blocking relay pulse queue: KB_Loop() runs on the main 10 ms tick, so
+// calculateKBStatus() must never vTaskDelay() to time a relay coil pulse —
+// that would stall sensing, voltage sampling and button polling for the
+// duration. Instead, pulses are queued here and stepped once per tick by
+// updateRelayQueue().
+#define RELAY_PULSE_MS    100
+#define RELAY_QUEUE_SIZE    8
+
+static gpio_num_t relayQueue[RELAY_QUEUE_SIZE];
+static uint8_t    relayQueueHead     = 0;      // pin currently pulsing / next to pulse
+static uint8_t    relayQueueTail     = 0;      // one past the last queued pin
+static bool       relayPulseOn       = false;  // true while the head pin's coil is energized
+static uint32_t   relayPulseDeadline = 0;      // millis() at which to de-energize it
+
+static void relayEnqueue(gpio_num_t pin) {
+    uint8_t next = (relayQueueTail + 1) % RELAY_QUEUE_SIZE;
+    if (next == relayQueueHead) {
+        ESP_LOGW(TAG, "relay queue full, dropping pulse");
+        return;
+    }
+    relayQueue[relayQueueTail] = pin;
+    relayQueueTail = next;
+}
+
 // Reads one ADC1 channel via the oneshot driver, configured in KB_Start().
 static uint16_t analogReadRaw(adc_channel_t channel) {
     int raw = 0;
@@ -76,6 +103,25 @@ static uint16_t analogRead(uint8_t p) {
 
 static uint32_t millis(void) {
     return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+// Advances the relay pulse queue by at most one step: releases the head pin
+// once it has been energized for RELAY_PULSE_MS, then energizes the next
+// queued pin. Non-blocking — must be called once per KB_Loop() tick.
+static void updateRelayQueue(void) {
+    if (relayPulseOn) {
+        if ((int32_t)(millis() - relayPulseDeadline) < 0) {
+            return;                      // still energized, not yet time to release
+        }
+        gpio_set_level(relayQueue[relayQueueHead], 0);
+        relayQueueHead = (relayQueueHead + 1) % RELAY_QUEUE_SIZE;
+        relayPulseOn = false;
+    }
+    if (relayQueueHead != relayQueueTail) {
+        gpio_set_level(relayQueue[relayQueueHead], 1);
+        relayPulseDeadline = millis() + RELAY_PULSE_MS;
+        relayPulseOn = true;
+    }
 }
 
 // TODO: configure GPIO direction for the relay coils (swapRelayPin /
@@ -98,6 +144,31 @@ void KB_Start(void) {
     adc_unit_t voltage_unit;
     ESP_ERROR_CHECK(adc_oneshot_io_to_channel(voltagePin, &voltage_unit, &voltagePinChannel));
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, voltagePinChannel, &chan_cfg));
+
+    // SW2 shorts buttonPin to GND, so it needs the internal pull-up.
+    gpio_config_t btn_cfg = {};
+    btn_cfg.pin_bit_mask = (1ULL << buttonPin);
+    btn_cfg.mode         = GPIO_MODE_INPUT;
+    btn_cfg.pull_up_en   = GPIO_PULLUP_ENABLE;
+    btn_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    btn_cfg.intr_type    = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&btn_cfg));
+
+    gpio_config_t relay_cfg = {};
+    relay_cfg.pin_bit_mask = (1ULL << swapRelayPin[0])   | (1ULL << swapRelayPin[1]) |
+                            (1ULL << switchRelayPin[0]) | (1ULL << switchRelayPin[1]);
+    relay_cfg.mode         = GPIO_MODE_OUTPUT;
+    relay_cfg.pull_up_en   = GPIO_PULLUP_DISABLE;
+    relay_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    relay_cfg.intr_type    = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&relay_cfg));
+
+    gpio_set_level((gpio_num_t)swapRelayPin[0], 1);
+    vTaskDelay(pdMS_TO_TICKS(100));  // wait for the relay to switch
+    gpio_set_level((gpio_num_t)swapRelayPin[0], 0);
+    gpio_set_level((gpio_num_t)switchRelayPin[1], 1);
+    vTaskDelay(pdMS_TO_TICKS(100));  // wait for the relay to switch
+    gpio_set_level((gpio_num_t)switchRelayPin[1], 0);
 }
 
 void KB_ExtA(const char *msg) {
@@ -410,6 +481,7 @@ static void updateVoltage(void) {
 // TODO: switch the relay when a reversal is required. Called from the main
 // 10 ms tick after the Melder inputs below have been sampled.
 void KB_Loop(void) {
+    updateRelayQueue();
     updateVoltage();
     updateButton();
 
@@ -443,8 +515,8 @@ void KB_Loop(void) {
         // advance ring index
         sensePinIndex[p] = (i + 1) % ADC_RING_SIZE;
 
-        if ((sensePinSums[p] / ADC_RING_SIZE) > 35) {
-            sensePinTimeOff[p] = millis() + 500;
+        if ((sensePinSums[p] / ADC_RING_SIZE) > SENSE_THRESHOLD_RAW) {
+            sensePinTimeOff[p] = millis() + SENSE_HOLD_MS;
             sensePinStatus[p] = 1;
         } else {
             if (sensePinTimeOff[p] <= millis()) {
