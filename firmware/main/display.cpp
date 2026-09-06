@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -145,10 +146,20 @@ static i2c_master_bus_handle_t s_bus = nullptr;
 static i2c_master_dev_handle_t s_dev = nullptr;
 static bool s_ok = false;
 
-// KB_Loop() draws from the main task, KB_ExtA()/KB_ExtB() draw from the MQTT
-// event task. Both would otherwise interleave in the framebuffer and clear
-// each other's dirty flags mid-frame.
-static SemaphoreHandle_t s_lock = nullptr;
+// Guards only the small network/screen cache below (s_screen, s_wifi_ok,
+// s_mqtt_ok, s_ip_str) against concurrent writes from the main task
+// (display_next_screen(), via the button) and the WiFi/MQTT event tasks
+// (display_set_network()). The framebuffer and the I2C bus are owned
+// exclusively by display_task() below and need no lock of their own.
+static SemaphoreHandle_t s_state_lock = nullptr;
+
+// display_update() must never block its caller (KB_Loop()'s 10 ms tick, or
+// the MQTT event task via KB_ExtA()/KB_ExtB()) on I2C. It only hands the
+// latest kb_state_t to display_task() through this length-1 "mailbox" queue
+// and returns immediately; the task does the actual drawing and the
+// potentially slow I2C flush on its own schedule.
+static QueueHandle_t s_kb_queue = nullptr;
+static TaskHandle_t  s_task     = nullptr;
 
 static uint8_t fb[OLED_PAGES][OLED_W];      // 1 bit per pixel, bit 0 = top of page
 static bool    fb_dirty[OLED_PAGES];
@@ -170,8 +181,8 @@ static esp_err_t oled_set_pos(uint8_t page, uint8_t col) {
 
 // Push every page whose content changed since the last flush. A panel that
 // stops answering takes the display out of service instead of making every
-// later redraw wait for the I2C timeout — the loop control must keep its
-// 10 ms tick with or without a display.
+// later redraw wait for the I2C timeout. Runs only on display_task(), so a
+// timeout here never delays KB_Loop()'s 10 ms tick or the MQTT event task.
 static void oled_flush(void) {
     uint8_t buf[1 + OLED_W];
     buf[0] = 0x40;                              // control byte: data stream
@@ -266,6 +277,7 @@ static const char *state_name(uint8_t status) {
         case 8:  return "FAIL low voltage";
         case 9:  return "FAIL stray voltage";
         case 10: return "FAIL train too long";
+        case 11: return "FAIL unexpected";
         default: return "?";
     }
 }
@@ -326,18 +338,18 @@ static void draw_loop_screen(const kb_state_t *kb) {
     fb_draw_line(7, 0, buf);
 }
 
-static void draw_network_screen(void) {
+static void draw_network_screen(bool wifi_ok, bool mqtt_ok, const char *ip_str) {
     char buf[32];
     // The label takes 6 of the 21 columns, so the value is cut to the 15 that
     // are left rather than silently overflowing the row.
 
-    snprintf(buf, sizeof(buf), "WiFi: %s", s_wifi_ok ? "OK" : "--");
+    snprintf(buf, sizeof(buf), "WiFi: %s", wifi_ok ? "OK" : "--");
     fb_draw_line(2, 0, buf);
 
-    snprintf(buf, sizeof(buf), "IP:   %s", s_ip_str);
+    snprintf(buf, sizeof(buf), "IP:   %s", ip_str);
     fb_draw_line(3, 0, buf);
 
-    snprintf(buf, sizeof(buf), "MQTT: %.15s", s_mqtt_ok ? mqtt_server : "--");
+    snprintf(buf, sizeof(buf), "MQTT: %.15s", mqtt_ok ? mqtt_server : "--");
     fb_draw_line(4, 0, buf);
 
     snprintf(buf, sizeof(buf), "ID:   %.15s", client_name);
@@ -373,10 +385,12 @@ static void draw_sensors_screen(const kb_state_t *kb) {
 // Public API
 // ---------------------------------------------------------------------------
 
+static void display_task(void *arg);
+
 void display_init(void) {
-    s_lock = xSemaphoreCreateMutex();
-    if (!s_lock) {
-        ESP_LOGE(TAG, "could not create the display mutex");
+    s_state_lock = xSemaphoreCreateMutex();
+    if (!s_state_lock) {
+        ESP_LOGE(TAG, "could not create the display state lock");
         return;
     }
 
@@ -445,6 +459,13 @@ void display_init(void) {
     fb_draw_str(0, 0, "Kehrschleife");
     oled_flush();
 
+    s_kb_queue = xQueueCreate(1, sizeof(kb_state_t));
+    if (!s_kb_queue || xTaskCreate(display_task, "display", 3072, nullptr, 2, &s_task) != pdPASS) {
+        ESP_LOGE(TAG, "could not start the display task, disabling the display");
+        s_ok = false;
+        return;
+    }
+
     if (s_ok) {
         ESP_LOGI(TAG, "SSD1306 initialised");
     }
@@ -452,45 +473,64 @@ void display_init(void) {
 
 void display_next_screen(void) {
     if (!s_ok) return;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
     s_screen = (display_screen_t)((s_screen + 1) % SCREEN_COUNT);
     ESP_LOGI(TAG, "screen %d/%d", s_screen + 1, (int)SCREEN_COUNT);
-    xSemaphoreGive(s_lock);
+    xSemaphoreGive(s_state_lock);
 }
 
 void display_set_network(bool wifi_ok, bool mqtt_ok, const char *ip_str) {
-    if (!s_lock) return;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (!s_state_lock) return;
+    xSemaphoreTake(s_state_lock, portMAX_DELAY);
     s_wifi_ok = wifi_ok;
     s_mqtt_ok = mqtt_ok;
     if (ip_str) {
         snprintf(s_ip_str, sizeof(s_ip_str), "%s", ip_str);
     }
-    xSemaphoreGive(s_lock);
+    xSemaphoreGive(s_state_lock);
+}
+
+// Runs the actual drawing and the I2C flush, on its own task — fully
+// decoupled from every caller of display_update(): this blocks here (on the
+// queue, and potentially on I2C inside oled_flush()), never the caller.
+static void display_task(void *arg) {
+    kb_state_t kb;
+    for (;;) {
+        xQueueReceive(s_kb_queue, &kb, portMAX_DELAY);
+
+        display_screen_t screen;
+        bool wifi_ok, mqtt_ok;
+        char ip_str[sizeof(s_ip_str)];
+        xSemaphoreTake(s_state_lock, portMAX_DELAY);
+        screen  = s_screen;
+        wifi_ok = s_wifi_ok;
+        mqtt_ok = s_mqtt_ok;
+        memcpy(ip_str, s_ip_str, sizeof(ip_str));
+        xSemaphoreGive(s_state_lock);
+
+        // Rows 0 and 1 are the same on every screen: what this board is and
+        // whether it is talking to anyone, then which page the button is on.
+        char head[48];
+        snprintf(head, sizeof(head), "%-15s%s", "Kehrschleife",
+                 wifi_ok ? (mqtt_ok ? "MQTT" : "WiFi") : "----");
+        fb_draw_line(0, 0, head);
+
+        snprintf(head, sizeof(head), "%-17.17s%u/%u", screen_title[screen],
+                 (unsigned)(screen + 1), (unsigned)SCREEN_COUNT);
+        fb_draw_line(1, 0, head);
+
+        switch (screen) {
+            case SCREEN_LOOP:    draw_loop_screen(&kb);                        break;
+            case SCREEN_NETWORK: draw_network_screen(wifi_ok, mqtt_ok, ip_str); break;
+            case SCREEN_SENSORS: draw_sensors_screen(&kb);                     break;
+            default: break;
+        }
+
+        oled_flush();
+    }
 }
 
 void display_update(const kb_state_t *kb) {
-    if (!s_ok || !kb) return;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-
-    // Rows 0 and 1 are the same on every screen: what this board is and
-    // whether it is talking to anyone, then which page the button is on.
-    char head[48];
-    snprintf(head, sizeof(head), "%-15s%s", "Kehrschleife",
-             s_wifi_ok ? (s_mqtt_ok ? "MQTT" : "WiFi") : "----");
-    fb_draw_line(0, 0, head);
-
-    snprintf(head, sizeof(head), "%-17.17s%u/%u", screen_title[s_screen],
-             (unsigned)(s_screen + 1), (unsigned)SCREEN_COUNT);
-    fb_draw_line(1, 0, head);
-
-    switch (s_screen) {
-        case SCREEN_LOOP:    draw_loop_screen(kb);    break;
-        case SCREEN_NETWORK: draw_network_screen();   break;
-        case SCREEN_SENSORS: draw_sensors_screen(kb); break;
-        default: break;
-    }
-
-    oled_flush();
-    xSemaphoreGive(s_lock);
+    if (!s_ok || !kb || !s_kb_queue) return;
+    xQueueOverwrite(s_kb_queue, kb);
 }

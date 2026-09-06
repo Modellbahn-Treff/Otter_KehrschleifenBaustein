@@ -9,7 +9,9 @@
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
+#include "esp_timer.h"
 #include <string.h>
+#include <stdlib.h>
 
 #include "kb.h"
 #include "display.h"
@@ -30,6 +32,98 @@ static char s_ip_str[16] = "---";
 // MQTT
 // ---------------------------------------------------------------------------
 
+static uint32_t millis(void) {
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+// Last values published on MqttOccupied/MqttStatus + "/state"/MqttVoltage,
+// so KB_Loop -> mqtt_publish_kb_state() (called once per 10 ms tick) only
+// enqueues a message when something actually changed.
+static bool     s_last_occupied       = false;
+static bool     s_last_occupied_valid = false;
+static uint8_t  s_last_status         = 0;
+static bool     s_last_status_valid   = false;
+static float    s_last_voltage_v      = 0.0f;
+static bool     s_last_voltage_valid  = false;
+static uint32_t s_last_voltage_publish_ms = 0;
+
+static void mqtt_publish_occupied(bool occupied) {
+    esp_mqtt_client_enqueue(mqtt_client, MqttOccupied, occupied ? "1" : "0", 0, 0, 0, true);
+}
+
+static void mqtt_publish_voltage(float voltage_v) {
+    char payload[16];
+    snprintf(payload, sizeof(payload), "%.2f", voltage_v);
+    esp_mqtt_client_enqueue(mqtt_client, MqttVoltage, payload, 0, 0, 0, true);
+}
+
+static void mqtt_publish_status(uint8_t status) {
+    char topic[SETTINGS_TOPIC_LEN + 8];
+    snprintf(topic, sizeof(topic), "%s/state", MqttStatus);
+    char payload[4];
+    snprintf(payload, sizeof(payload), "%u", status);
+    esp_mqtt_client_enqueue(mqtt_client, topic, payload, 0, 0, 0, true);
+}
+
+// Publishes MqttOccupied, MqttVoltage and MqttStatus/state unconditionally,
+// e.g. in response to otter/Refresh or right after (re)connecting.
+static void mqtt_republish_all(void) {
+    kb_state_t state;
+    KB_GetState(&state);
+
+    bool  occupied   = (state.status != 0);
+    float voltage_v  = state.voltage_mv / 1000.0f;
+
+    mqtt_publish_occupied(occupied);
+    mqtt_publish_voltage(voltage_v);
+    mqtt_publish_status(state.status);
+
+    s_last_occupied           = occupied;
+    s_last_occupied_valid     = true;
+    s_last_status             = state.status;
+    s_last_status_valid       = true;
+    s_last_voltage_v          = voltage_v;
+    s_last_voltage_valid      = true;
+    s_last_voltage_publish_ms = millis();
+}
+
+// Called once per KB_Loop() tick: publishes MqttOccupied and MqttStatus/state
+// whenever they change, and MqttVoltage at most once a second and only if it
+// moved by more than 5% since the last publish.
+static void mqtt_publish_kb_state(void) {
+    kb_state_t state;
+    KB_GetState(&state);
+
+    bool occupied = (state.status != 0);
+    if (!s_last_occupied_valid || occupied != s_last_occupied) {
+        mqtt_publish_occupied(occupied);
+        s_last_occupied       = occupied;
+        s_last_occupied_valid = true;
+    }
+
+    if (!s_last_status_valid || state.status != s_last_status) {
+        mqtt_publish_status(state.status);
+        s_last_status       = state.status;
+        s_last_status_valid = true;
+    }
+
+    float voltage_v = state.voltage_mv / 1000.0f;
+    if (!s_last_voltage_valid) {
+        mqtt_publish_voltage(voltage_v);
+        s_last_voltage_v          = voltage_v;
+        s_last_voltage_valid      = true;
+        s_last_voltage_publish_ms = millis();
+    } else if ((uint32_t)(millis() - s_last_voltage_publish_ms) >= 1000) {
+        float delta = (voltage_v > s_last_voltage_v) ? (voltage_v - s_last_voltage_v) : (s_last_voltage_v - voltage_v);
+        bool  changed = (s_last_voltage_v == 0.0f) ? (voltage_v != 0.0f) : (delta > 0.05f * s_last_voltage_v);
+        if (changed) {
+            mqtt_publish_voltage(voltage_v);
+            s_last_voltage_v          = voltage_v;
+            s_last_voltage_publish_ms = millis();
+        }
+    }
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                 int32_t event_id, void *event_data)
 {
@@ -44,6 +138,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             esp_mqtt_client_subscribe(mqtt_client, MqttSet, 0);
             esp_mqtt_client_subscribe(mqtt_client, MqttExtA, 0);
             esp_mqtt_client_subscribe(mqtt_client, MqttExtB, 0);
+            {
+                char status_set_topic[SETTINGS_TOPIC_LEN + 8];
+                snprintf(status_set_topic, sizeof(status_set_topic), "%s/set", MqttStatus);
+                esp_mqtt_client_subscribe(mqtt_client, status_set_topic, 0);
+            }
+            mqtt_republish_all();  // announce current state to freshly (re)connected subscribers
             break;
 
         case MQTT_EVENT_DISCONNECTED:
@@ -65,7 +165,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
             if (strcmp(topic, MqttRefresh) == 0) {
                 ESP_LOGI(TAG, "Refresh angefragt");
-                // TODO: publish current KB state once implemented
+                mqtt_republish_all();
             }
             if (strcmp(topic, MqttSet) == 0) {
                 ESP_LOGI(TAG, "Settings update via MQTT");
@@ -99,6 +199,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             }
             if (strcmp(topic, MqttExtB) == 0) {
                 KB_ExtB(msg);
+            }
+            {
+                char status_set_topic[SETTINGS_TOPIC_LEN + 8];
+                snprintf(status_set_topic, sizeof(status_set_topic), "%s/set", MqttStatus);
+                if (strcmp(topic, status_set_topic) == 0) {
+                    ESP_LOGI(TAG, "Status forced via MQTT: %s", msg);
+                    KB_SetStatus((uint8_t)atoi(msg));
+                }
             }
             break;
         }
@@ -210,5 +318,6 @@ extern "C" void app_main() {
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(10));
         KB_Loop();
+        mqtt_publish_kb_state();
     }
 }

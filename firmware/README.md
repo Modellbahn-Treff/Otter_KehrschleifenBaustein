@@ -2,7 +2,7 @@
 
 ESP32 firmware for the Otter model railroad control system. Each board runs exactly one KehrschleifenBaustein (reversing-loop module), which switches track polarity via its bistable relays (K1/K2) and reports/controls state over WiFi and MQTT.
 
-**Status: work in progress.** The occupancy sensing, loop-voltage measurement, the [state machine](#state-machine) in [main/kb.cpp](main/kb.cpp) and the [OLED display](#display) are implemented; the relay switching and the MQTT publishing of the state are not yet — see the `TODO`s there. Everything else (WiFi/MQTT bring-up, NVS-backed settings, serial console) mirrors the [Otter_VerteilerBaustein](../../Otter_VerteilerBaustein) firmware structure.
+**Status: work in progress.** The occupancy sensing, loop-voltage measurement, the [state machine](#state-machine) in [main/kb.cpp](main/kb.cpp), the K1/K2 relay switching, and the [OLED display](#display) are implemented and tested; the MQTT publishing of the state is not yet — see the `TODO`s there. Everything else (WiFi/MQTT bring-up, NVS-backed settings, serial console) mirrors the [Otter_VerteilerBaustein](../../Otter_VerteilerBaustein) firmware structure.
 
 ## Requirements
 
@@ -236,7 +236,7 @@ no bus traffic.
 ```
 main/
 ├── main.cpp              – Entry point; WiFi & MQTT initialisation
-├── kb.cpp / kb.h         – Kehrschleifen (reversing-loop) module logic: sensing, voltage, state machine [relay TODO]
+├── kb.cpp / kb.h         – Kehrschleifen (reversing-loop) module logic: sensing, voltage, state machine, K1/K2 relay switching
 ├── display.cpp / .h      – SSD1306 OLED driver and the screens described below
 ├── settings.cpp / .h     – NVS-backed configuration store
 ├── serial_config.cpp / .h – Serial configuration console

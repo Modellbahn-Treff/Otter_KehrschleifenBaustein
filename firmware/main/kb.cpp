@@ -8,15 +8,15 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 
 static const char *TAG = "KB";
 
-static void calculateKBStatus(void);
+static void calculateKBStatus(bool isrecursive = false);
 static void updateDisplay(void);
 
-#define SENSE_PIN_COUNT 3
 #define ADC_RING_SIZE   20
 
 #define ADC_VREF_MV            3300  // nominal ADC1 full-scale at ADC_ATTEN_DB_12 (uncalibrated)
@@ -30,10 +30,25 @@ static void updateDisplay(void);
 #define DISPLAY_REFRESH_MS      250  // redraw interval for the live values (voltage, raw ADC)
 #define BUTTON_DEBOUNCE_MS       50  // ignore further edges on the screen button for this long
 
-static uint8_t  kbStatus = 0;                                     // 0=off, 1=Train is about to enter from A, 2=Train entered from A, 3=Train leaving through B, 4=Train is about to enter from B, 5= Train entered from B, 6=Train leaving through A, 7=Fail-safe because of trains on both sides, 8=Fail-safe because of low voltage, 9=Fail-safe because of voltage during off state, 10=Fail-safe because of too long train in the loop
+static uint8_t  kbStatus = 0;                                     // 0=off, 1=Train is about to enter from A, 2=Train entered from A, 3=Train leaving through B, 4=Train is about to enter from B, 5= Train entered from B, 6=Train leaving through A, 7=Fail-safe because of trains on both sides, 8=Fail-safe because of low voltage, 9=Fail-safe because of voltage during off state, 10=Fail-safe because of too long train in the loop, 11=Fail-safe because of unknown reason (e.g. two trains inside the loop at the same time)
+
+// calculateKBStatus() runs on the main task (KB_Loop -> updateVoltage /
+// sense pin handling) but is also invoked from the MQTT event task
+// (KB_ExtA/KB_ExtB), and KB_SetStatus() (also MQTT task) writes kbStatus and
+// the edge-tracking statics directly. This recursive mutex serializes all
+// three entry points so a forced status via MQTT can never interleave with
+// an in-progress sensor-driven transition. Recursive because
+// calculateKBStatus() calls itself to settle multi-step transitions.
+static SemaphoreHandle_t kbMutex = nullptr;
+
+// Inputs as seen at the previous calculateKBStatus() call, used to detect
+// edges. File-scope (rather than local statics) so KB_SetStatus() can
+// resync them when forcing a status, keeping them consistent with the
+// current sensor state instead of going stale.
+static bool lastExtA = false, lastIntA = false, lastIntM = false, lastIntB = false, lastExtB = false;
 
 static float    voltage = 0.0f;                                   // voltage in the loop, in mV
-static uint16_t voltageRaw = 0;                                   // averaged raw ADC reading behind `voltage`
+static uint16_t voltageRaw = 0;                                   // peak raw ADC reading behind `voltage`
 static bool     voltagePresent = false;                           // true if voltage is present in the loop (above VOLTAGE_THRESHOLD_MV)
 
 static bool     ExtA = false;                                     // true if ExtA is occupied
@@ -44,6 +59,9 @@ static bool     ExtB = false;                                     // true if Ext
 
 static bool     trainLost   = false;                              // true while a train vanished inside the loop without passing ExtA/ExtB
 static uint32_t trainLostAt = 0;                                  // millis() when the train vanished
+
+static bool     relaisJustSwitched = false;                       // true for 100ms after a relay pulse, to avoid misreading the Voltage sensor
+static uint32_t relaisSwitchedAt = 0;                             // millis() when the relais pulse ended
 
 static uint8_t  sensePinStatus[SENSE_PIN_COUNT];
 static uint8_t  sensePinLastStatus[SENSE_PIN_COUNT] = {2, 2, 2};  // 0=not occupied, 1=occupied, 2=unknown (force a publish on the first loop)
@@ -58,7 +76,6 @@ static adc_channel_t voltagePinChannel;
 
 static uint16_t voltagePinSamples[ADC_RING_SIZE];  // ring buffer of raw ADC samples (0..4095)
 static uint8_t  voltagePinIndex = 0;                // ring index
-static uint32_t voltagePinSum   = 0;                // running sum
 
 // Non-blocking relay pulse queue: KB_Loop() runs on the main 10 ms tick, so
 // calculateKBStatus() must never vTaskDelay() to time a relay coil pulse —
@@ -74,14 +91,40 @@ static uint8_t    relayQueueTail     = 0;      // one past the last queued pin
 static bool       relayPulseOn       = false;  // true while the head pin's coil is energized
 static uint32_t   relayPulseDeadline = 0;      // millis() at which to de-energize it
 
+// relayEnqueue() is called from both the main task (KB_Loop -> calculateKBStatus)
+// and the MQTT event task (KB_ExtA/KB_ExtB -> calculateKBStatus), and
+// updateRelayQueue() (main task only) shares the same queue state. A spinlock
+// keeps the two from corrupting relayQueueHead/Tail — critical sections here
+// are a handful of instructions, so this never meaningfully delays the 10 ms
+// tick the way a blocking mutex could.
+static portMUX_TYPE relayMux = portMUX_INITIALIZER_UNLOCKED;
+
 static void relayEnqueue(gpio_num_t pin) {
+    portENTER_CRITICAL(&relayMux);
     uint8_t next = (relayQueueTail + 1) % RELAY_QUEUE_SIZE;
     if (next == relayQueueHead) {
+        portEXIT_CRITICAL(&relayMux);
         ESP_LOGW(TAG, "relay queue full, dropping pulse");
         return;
     }
     relayQueue[relayQueueTail] = pin;
     relayQueueTail = next;
+    portEXIT_CRITICAL(&relayMux);
+}
+
+// Energizes the relay pair matching `newStatus`, if it enters a polarity
+// group (off/fail-safe, "A", "B") that `previousStatus` was not already in.
+// Shared by calculateKBStatus() and KB_SetStatus() (forced status via MQTT).
+static void applyRelayForStatus(uint8_t newStatus, uint8_t previousStatus) {
+    if (newStatus == 0 || newStatus >= 7) {
+        relayEnqueue((gpio_num_t)switchRelayPin[1]);  //turn off the loop
+    } else if ((newStatus == 1 || newStatus == 2 || newStatus == 6) && (previousStatus != 1 && previousStatus != 2 && previousStatus != 6)) {
+        relayEnqueue((gpio_num_t)swapRelayPin[1]);
+        relayEnqueue((gpio_num_t)switchRelayPin[0]); //turn on the loop
+    } else if ((newStatus == 3 || newStatus == 4 || newStatus == 5) && (previousStatus != 3 && previousStatus != 4 && previousStatus != 5)) {
+        relayEnqueue((gpio_num_t)swapRelayPin[0]);
+        relayEnqueue((gpio_num_t)switchRelayPin[0]);  //turn on the loop
+    }
 }
 
 // Reads one ADC1 channel via the oneshot driver, configured in KB_Start().
@@ -109,24 +152,29 @@ static uint32_t millis(void) {
 // once it has been energized for RELAY_PULSE_MS, then energizes the next
 // queued pin. Non-blocking — must be called once per KB_Loop() tick.
 static void updateRelayQueue(void) {
+    portENTER_CRITICAL(&relayMux);
     if (relayPulseOn) {
         if ((int32_t)(millis() - relayPulseDeadline) < 0) {
+            portEXIT_CRITICAL(&relayMux);
             return;                      // still energized, not yet time to release
         }
         gpio_set_level(relayQueue[relayQueueHead], 0);
         relayQueueHead = (relayQueueHead + 1) % RELAY_QUEUE_SIZE;
         relayPulseOn = false;
+        relaisJustSwitched = true;  // mark that a relay has just switched
+        relaisSwitchedAt = millis();  // record when the relay switched
     }
     if (relayQueueHead != relayQueueTail) {
         gpio_set_level(relayQueue[relayQueueHead], 1);
         relayPulseDeadline = millis() + RELAY_PULSE_MS;
         relayPulseOn = true;
     }
+    portEXIT_CRITICAL(&relayMux);
 }
 
-// TODO: configure GPIO direction for the relay coils (swapRelayPin /
-// switchRelayPin) once their switching sequence is known.
 void KB_Start(void) {
+    kbMutex = xSemaphoreCreateRecursiveMutex();
+
     adc_oneshot_unit_init_cfg_t init_cfg = {};
     init_cfg.unit_id = ADC_UNIT_1;
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &adc1_handle));
@@ -230,9 +278,8 @@ void KB_ExtB(const char *msg) {
 //
 // Called whenever one of the inputs (ExtA, ExtB, IntA, IntM, IntB,
 // voltagePresent) changes, and once more when the lost-train timeout expires.
-static void calculateKBStatus(void) {
-    // Inputs as seen at the previous call, used to detect edges.
-    static bool lastExtA = false, lastIntA = false, lastIntM = false, lastIntB = false, lastExtB = false;
+static void calculateKBStatus(bool isrecursive) {
+    xSemaphoreTakeRecursive(kbMutex, portMAX_DELAY);
 
     uint8_t previousStatus = kbStatus;
 
@@ -276,7 +323,7 @@ static void calculateKBStatus(void) {
     bool leftLoop = allClear && !trainLost;
 
     if (kbStatus == 0) {             // off: loop unpowered, nothing approaching
-        if (voltagePresent) {
+        if (voltagePresent && !relaisJustSwitched) {
             kbStatus = 9;            // 0 -> 9: voltage inside the loop although it should be off -> fail-safe
         } else if (ExtA && !ExtB) {
             kbStatus = 1;            // 0 -> 1: train approaching on side A only -> prepare entry from A
@@ -285,17 +332,19 @@ static void calculateKBStatus(void) {
         }
         // ExtA && ExtB at the same time: stay off, nobody may enter.
     } else if (kbStatus == 1) {      // Train is about to enter from A (loop powered, polarity A)
-        if (!voltagePresent) {
+        if (!voltagePresent && !relaisJustSwitched) {
             kbStatus = 8;            // 1 -> 8: loop should be powered but is not -> fail-safe
         } else if (ExtB) {
             kbStatus = 7;            // 1 -> 7: a second train shows up on side B -> fail-safe
-        } else if (IntA) {
-            kbStatus = 2;            // 1 -> 2: head of the train reached IntA -> train is entering
+        } else if (IntB) {
+            kbStatus = 11;           // 1 -> 11: a second train shows up on IntB -> fail-safe
+        } else if (IntA || IntM) {
+            kbStatus = 2;            // 1 -> 2: head of the train reached IntA or IntM -> train is entering
         } else if (!ExtA) {
             kbStatus = 0;            // 1 -> 0: train reversed and backed away from side A without entering -> off
         }
     } else if (kbStatus == 2) {      // Train entered from A (polarity A, train on ExtA and/or IntA..IntM)
-        if (!voltagePresent) {
+        if (!voltagePresent && !relaisJustSwitched) {
             kbStatus = 8;            // 2 -> 8: loop lost power while a train is inside -> fail-safe
         } else if (ExtB) {
             kbStatus = 7;            // 2 -> 7: another train shows up on side B -> fail-safe
@@ -311,7 +360,7 @@ static void calculateKBStatus(void) {
         // A train that reverses while still inside keeps polarity A; it can
         // only reach gap A, and reaching IntB switches to 3.
     } else if (kbStatus == 3) {      // Train leaving through B (polarity B, train fully inside or straddling gap B)
-        if (!voltagePresent) {
+        if (!voltagePresent && !relaisJustSwitched) {
             kbStatus = 8;            // 3 -> 8: loop lost power while the train is leaving -> fail-safe
         } else if (headingA) {
             kbStatus = 6;            // 3 -> 6: train reversed and is heading back to A while fully inside -> switch to polarity A
@@ -325,17 +374,19 @@ static void calculateKBStatus(void) {
             kbStatus = 0;            // 3 -> 0: loop empty, trains on both sides -> off, nobody may enter
         }
     } else if (kbStatus == 4) {      // Train is about to enter from B (loop powered, polarity B)
-        if (!voltagePresent) {
+        if (!voltagePresent && !relaisJustSwitched) {
             kbStatus = 8;            // 4 -> 8: loop should be powered but is not -> fail-safe
         } else if (ExtA) {
             kbStatus = 7;            // 4 -> 7: a second train shows up on side A -> fail-safe
-        } else if (IntB) {
-            kbStatus = 5;            // 4 -> 5: head of the train reached IntB -> train is entering
+        } else if (IntA) {
+            kbStatus = 11;           // 4 -> 11: a second train shows up on IntA -> fail-safe
+        } else if (IntB || IntM) {
+            kbStatus = 5;            // 4 -> 5: head of the train reached IntB or IntM -> train is entering
         } else if (!ExtB) {
             kbStatus = 0;            // 4 -> 0: train reversed and backed away from side B without entering -> off
         }
     } else if (kbStatus == 5) {      // Train entered from B (polarity B, train on ExtB and/or IntB..IntM)
-        if (!voltagePresent) {
+        if (!voltagePresent && !relaisJustSwitched) {
             kbStatus = 8;            // 5 -> 8: loop lost power while a train is inside -> fail-safe
         } else if (ExtA) {
             kbStatus = 7;            // 5 -> 7: another train shows up on side A -> fail-safe
@@ -351,7 +402,7 @@ static void calculateKBStatus(void) {
         // A train that reverses while still inside keeps polarity B; it can
         // only reach gap B, and reaching IntA switches to 6.
     } else if (kbStatus == 6) {      // Train leaving through A (polarity A, train fully inside or straddling gap A)
-        if (!voltagePresent) {
+        if (!voltagePresent && !relaisJustSwitched) {
             kbStatus = 8;            // 6 -> 8: loop lost power while the train is leaving -> fail-safe
         } else if (headingB) {
             kbStatus = 3;            // 6 -> 3: train reversed and is heading back to B while fully inside -> switch to polarity B
@@ -380,6 +431,13 @@ static void calculateKBStatus(void) {
         if (allClear && !voltagePresent) {
             kbStatus = 0;            // 10 -> 0: train removed and loop unpowered -> back to off
         }
+    } else if (kbStatus == 11) {     // Fail-safe because of unknown reason (e.g. two trains inside the loop at the same time)
+        if (allClear && !voltagePresent) {
+            kbStatus = 0;            // 11 -> 0: all detectors clear and loop unpowered -> back to off
+        }
+    } else {
+        ESP_LOGW(TAG, "unknown kbStatus %u, resetting to 11", kbStatus);
+        kbStatus = 11;
     }
 
     lastExtA = ExtA;
@@ -395,16 +453,46 @@ static void calculateKBStatus(void) {
     if (kbStatus != previousStatus) {
         ESP_LOGI(TAG, "kbStatus: %u -> %u", previousStatus, kbStatus);
 
-        if (kbStatus == 0 || kbStatus >= 7) {
-            relayEnqueue((gpio_num_t)switchRelayPin[1]);  //turn off the loop
-        } else if (kbStatus == 1 || kbStatus == 2 || kbStatus == 6) {
-            relayEnqueue((gpio_num_t)switchRelayPin[0]); //turn on the loop
-            relayEnqueue((gpio_num_t)swapRelayPin[1]);
-        } else if (kbStatus == 3 || kbStatus == 4 || kbStatus == 5) {
-            relayEnqueue((gpio_num_t)switchRelayPin[0]);  //turn on the loop
-            relayEnqueue((gpio_num_t)swapRelayPin[0]);
+        applyRelayForStatus(kbStatus, previousStatus);
+
+        bool offOrFailsafe = (kbStatus == 0 || kbStatus >= 7);
+        bool enteredGroupA = (kbStatus == 1 || kbStatus == 2 || kbStatus == 6) && (previousStatus != 1 && previousStatus != 2 && previousStatus != 6);
+        bool enteredGroupB = (kbStatus == 3 || kbStatus == 4 || kbStatus == 5) && (previousStatus != 3 && previousStatus != 4 && previousStatus != 5);
+        if (!offOrFailsafe && !enteredGroupA && !enteredGroupB && !isrecursive) {
+            calculateKBStatus(true);  // re-evaluate the state machine
         }
     }
+
+    xSemaphoreGiveRecursive(kbMutex);
+}
+
+// Forces the state machine straight to `status` and switches the relays to
+// match, bypassing the normal sensor-driven transitions. Used by the
+// otter/KB/Status/set MQTT command. Subsequent sensor edges continue the
+// state machine from this new status as usual.
+void KB_SetStatus(uint8_t status) {
+    if (status > 11) {
+        ESP_LOGW(TAG, "KB_SetStatus: invalid status %u, ignoring", status);
+        return;
+    }
+    xSemaphoreTakeRecursive(kbMutex, portMAX_DELAY);
+    uint8_t previousStatus = kbStatus;
+    kbStatus  = status;
+    trainLost = false;
+    // Resync the edge-tracking statics to the current sensor state, so the
+    // next real calculateKBStatus() call does not compute a spurious edge
+    // from whatever they were left at before this forced jump.
+    lastExtA = ExtA;
+    lastIntA = IntA;
+    lastIntM = IntM;
+    lastIntB = IntB;
+    lastExtB = ExtB;
+    if (kbStatus != previousStatus) {
+        ESP_LOGI(TAG, "kbStatus (forced via MQTT): %u -> %u", previousStatus, kbStatus);
+        applyRelayForStatus(kbStatus, previousStatus);
+    }
+    xSemaphoreGiveRecursive(kbMutex);
+    updateDisplay();
 }
 
 void KB_GetState(kb_state_t *out) {
@@ -454,37 +542,49 @@ static void updateButton(void) {
 // Measures the loop voltage via voltagePin (75k/10k divider, R41/R42) and
 // sets `voltage` to true once it exceeds VOLTAGE_THRESHOLD_MV (10 V).
 static void updateVoltage(void) {
-    voltagePinSum -= voltagePinSamples[voltagePinIndex];
     uint16_t raw = analogReadRaw(voltagePinChannel);
     voltagePinSamples[voltagePinIndex] = raw;
-    voltagePinSum += raw;
     voltagePinIndex = (voltagePinIndex + 1) % ADC_RING_SIZE;
 
-    uint32_t avg_raw = voltagePinSum / ADC_RING_SIZE;
-    uint32_t pin_mv   = (avg_raw * ADC_VREF_MV) / ADC_MAX_RAW;
+    // Peak-hold over the ring buffer rather than an average, so a brief
+    // pulse (e.g. a short DCC/AC half-wave) isn't smoothed away.
+    uint16_t max_raw = 0;
+    for (uint8_t i = 0; i < ADC_RING_SIZE; i++) {
+        if (voltagePinSamples[i] > max_raw) {
+            max_raw = voltagePinSamples[i];
+        }
+    }
+
+    uint32_t pin_mv   = ((uint32_t)max_raw * ADC_VREF_MV) / ADC_MAX_RAW;
     uint32_t loop_mv  = pin_mv * (VOLTAGE_DIVIDER_TOP_K + VOLTAGE_DIVIDER_BOT_K) / VOLTAGE_DIVIDER_BOT_K;
 
     // Kept up to date on every sample, not only on threshold crossings, so
     // the display shows the actual reading.
     voltage    = loop_mv;
-    voltageRaw = (uint16_t)avg_raw;
+    voltageRaw = max_raw;
 
     bool newVoltage = (loop_mv > VOLTAGE_THRESHOLD_MV);
     if (newVoltage != voltagePresent) {
         voltagePresent = newVoltage;
         ESP_LOGI(TAG, "voltage: %s (%lu mV)", voltagePresent ? "present" : "absent", (unsigned long)voltage);
-        calculateKBStatus();
-        updateDisplay();
+        if (!relaisJustSwitched) {
+            calculateKBStatus();
+            updateDisplay();
+        }
     }
 }
 
-// TODO: switch the relay when a reversal is required. Called from the main
-// 10 ms tick after the Melder inputs below have been sampled.
+// Called from the main 10 ms tick after the Melder inputs below have been
+// sampled.
 void KB_Loop(void) {
     updateRelayQueue();
-    updateVoltage();
     updateButton();
+    updateVoltage();
 
+    if (relaisJustSwitched && (uint32_t)(millis() - relaisSwitchedAt) >= 100) {
+        relaisJustSwitched = false;
+        calculateKBStatus();
+    }
     // The state machine redraws on every change, but the voltage and the raw
     // ADC values move without one, so refresh them on a slow tick as well.
     // Unchanged display pages cost no I2C traffic.
