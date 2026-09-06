@@ -1,0 +1,23 @@
+{
+  "name": "Otter KehrschleifenBaustein",
+  "version": "8bc7a2f",
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        {
+          "path": "bootloader.bin",
+          "offset": 4096
+        },
+        {
+          "path": "partition-table.bin",
+          "offset": 32768
+        },
+        {
+          "path": "otter_kb.bin",
+          "offset": 65536
+        }
+      ]
+    }
+  ]
+}
